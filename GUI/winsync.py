@@ -7,14 +7,15 @@ winsync.py
 - Множественные пары папок
 - Фильтрацию (исключения)
 - Предварительное сравнение (dry-run)
-- Сохранение/загрузку конфигурации в XML
+- Сохранение/загрузку конфигурации в XML (*.ws)
 - Удаление в корзину (требуется Send2Trash)
+- Контекстное меню копирования в логе
+- Режим синхронизации в вкладке "Пары папок"
 """
 import os
 import sys
 import shutil
 import threading
-import queue
 import stat
 import re
 import xml.etree.ElementTree as ET
@@ -46,6 +47,12 @@ def normalize_path(path):
 
 def get_file_streams(filepath):
     """Получает список всех альтернативных потоков данных (ADS) для файла."""
+    # Проверяем наличие необходимого атрибута
+    if not hasattr(win32file, 'FindFirstStreamW'):
+        with ERRORS_LOCK:
+            ERRORS.append(f"Функция FindFirstStreamW недоступна. Пропуск ADS для {filepath}.")
+        return []
+
     try:
         streams = []
         handle = win32file.FindFirstStreamW(filepath, win32file.StreamInfoTypes.FindStreamInfoStandard)
@@ -121,7 +128,6 @@ def analyze_sync(source, destination, mode, exclude_patterns):
     actions = []
     source_path = Path(normalize_path(source))
     dest_path = Path(normalize_path(destination))
-    
     # Проход по источнику
     for root, dirs, files in os.walk(source_path):
         rel_path = os.path.relpath(root, source_path)
@@ -145,7 +151,6 @@ def analyze_sync(source, destination, mode, exclude_patterns):
                     actions.append(('copy_file', src_file, dst_file))
             else:
                 actions.append(('copy_file', src_file, dst_file))
-    
     # Удаление в режиме mirror
     if mode == 'mirror' and dest_path.exists():
         for root, dirs, files in os.walk(dest_path, topdown=False):
@@ -201,7 +206,7 @@ def apply_sync(actions, progress_callback=None):
 class SyncApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Windows синхронизация v3")
+        self.root.title("Windows синхронизация")
         self.root.geometry("800x600")
         self.root.resizable(True, True)
         self.exclude_patterns = [
@@ -217,12 +222,24 @@ class SyncApp:
     def create_widgets(self):
         style = ttk.Style()
         style.theme_use('vista')
+
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(1, weight=1)
+
+        # Верхнее меню
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Файл", menu=file_menu)
+        file_menu.add_command(label="Сохранить конфигурацию", command=self.save_config)
+        file_menu.add_command(label="Загрузить конфигурацию", command=self.load_config)
+        file_menu.add_separator()
+        file_menu.add_command(label="Выход", command=self.root.quit)
 
         # Notebook (вкладки)
         notebook = ttk.Notebook(main_frame)
@@ -239,42 +256,52 @@ class SyncApp:
         notebook.add(filter_frame, text="Фильтры")
         self.setup_filter_tab(filter_frame)
 
-        # Режим синхронизации
-        mode_frame = ttk.Frame(main_frame)
-        mode_frame.grid(row=1, column=0, sticky=tk.W, pady=5)
-        ttk.Label(mode_frame, text="Режим:").pack(side=tk.LEFT)
-        self.mode_var = tk.StringVar(value="update")
-        ttk.Radiobutton(mode_frame, text="Обновление", variable=self.mode_var, value="update").pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Radiobutton(mode_frame, text="Зеркало", variable=self.mode_var, value="mirror").pack(side=tk.LEFT, padx=(10, 0))
-
         # Кнопки управления
         btn_frame = ttk.Frame(main_frame)
-        btn_frame.grid(row=2, column=0, pady=10)
+        btn_frame.grid(row=1, column=0, pady=10)
+
         ttk.Button(btn_frame, text="Сравнить", command=self.compare_sync).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Запустить синхронизацию", command=self.start_sync).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Сохранить конфиг...", command=self.save_config).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Загрузить конфиг...", command=self.load_config).pack(side=tk.LEFT, padx=5)
 
         # Прогресс и лог
         self.progress = ttk.Progressbar(main_frame, orient="horizontal", mode="determinate")
-        self.progress.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        self.progress.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         self.progress.grid_remove()
 
         self.log_text = tk.Text(main_frame, height=10, state='disabled')
-        self.log_text.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        self.log_text.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=self.log_text.yview)
-        scrollbar.grid(row=4, column=1, sticky=(tk.N, tk.S))
+        scrollbar.grid(row=3, column=1, sticky=(tk.N, tk.S))
         self.log_text.configure(yscrollcommand=scrollbar.set)
         self.log_text.grid_remove()
-        main_frame.rowconfigure(4, weight=1)
+
+        # Контекстное меню для лога
+        self.log_context_menu = tk.Menu(self.log_text, tearoff=0)
+        self.log_context_menu.add_command(label="Копировать", command=self.copy_selected_log)
+        self.log_text.bind("<Button-3>", self.show_log_context_menu)  # ПКМ на Windows
+
+        main_frame.rowconfigure(3, weight=1)
 
     def setup_pairs_tab(self, parent):
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=1)
-        btn_frame = ttk.Frame(parent)
-        btn_frame.grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
+        parent.rowconfigure(2, weight=1)
+
+        # Кнопки и режим синхронизации
+        top_frame = ttk.Frame(parent)
+        top_frame.grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
+
+        btn_frame = ttk.Frame(top_frame)
+        btn_frame.pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="Добавить пару", command=self.add_pair).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="Удалить выбранное", command=self.remove_pair).pack(side=tk.LEFT)
+
+        # Режим синхронизации
+        mode_frame = ttk.Frame(top_frame)
+        mode_frame.pack(side=tk.RIGHT)
+        ttk.Label(mode_frame, text="Режим:").pack(side=tk.LEFT)
+        self.mode_var = tk.StringVar(value="update")
+        ttk.Radiobutton(mode_frame, text="Обновление", variable=self.mode_var, value="update").pack(side=tk.LEFT, padx=(5, 10))
+        ttk.Radiobutton(mode_frame, text="Зеркало", variable=self.mode_var, value="mirror").pack(side=tk.LEFT, padx=(0, 10))
 
         # Treeview для пар
         columns = ('source', 'dest')
@@ -283,10 +310,10 @@ class SyncApp:
         self.tree.heading('dest', text='Целевая папка')
         self.tree.column('source', width=300)
         self.tree.column('dest', width=300)
-        self.tree.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        parent.rowconfigure(1, weight=1)
+        self.tree.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
         vsb = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
-        vsb.grid(row=1, column=1, sticky=(tk.N, tk.S))
+        vsb.grid(row=2, column=1, sticky=(tk.N, tk.S))
         self.tree.configure(yscrollcommand=vsb.set)
 
     def setup_filter_tab(self, parent):
@@ -415,19 +442,24 @@ class SyncApp:
                 for grand in child.winfo_children():
                     if isinstance(grand, ttk.Button) and grand.cget('text') in ["Сравнить", "Запустить синхронизацию"]:
                         grand.config(state=state)
-        self.progress.grid_remove() if enabled else None
+        if enabled:
+            self.progress.grid_remove()
 
     def save_config(self):
         pairs = self.get_pairs()
         if not pairs:
             messagebox.showwarning("Предупреждение", "Нет пар для сохранения.")
             return
+
+        initial_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         filepath = filedialog.asksaveasfilename(
-            defaultextension=".xml",
-            filetypes=[("XML files", "*.xml"), ("All files", "*.*")]
+            initialdir=initial_dir,
+            defaultextension=".ws",
+            filetypes=[("Workstation Sync Config", "*.ws"), ("All files", "*.*")]
         )
         if not filepath:
             return
+
         root = ET.Element("SyncConfig")
         pairs_el = ET.SubElement(root, "FolderPairs")
         for src, dst in pairs:
@@ -440,40 +472,68 @@ class SyncApp:
             ET.SubElement(exclude_el, "Item").text = pat
         mode_el = ET.SubElement(root, "Mode")
         mode_el.text = self.mode_var.get()
+
         tree = ET.ElementTree(root)
         tree.write(filepath, encoding='utf-8', xml_declaration=True)
         self.log_message(f"Конфигурация сохранена: {filepath}")
 
     def load_config(self):
+        initial_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         filepath = filedialog.askopenfilename(
-            filetypes=[("XML files", "*.xml"), ("All files", "*.*")]
+            initialdir=initial_dir,
+            filetypes=[("Workstation Sync Config", "*.ws"), ("All files", "*.*")]
         )
         if not filepath:
             return
+
         try:
             tree = ET.parse(filepath)
             root = tree.getroot()
+
             # Очистка текущих пар
             for item in self.tree.get_children():
                 self.tree.delete(item)
+
             # Загрузка пар
-            for pair in root.find("FolderPairs").findall("Pair"):
-                left = pair.find("Left").text
-                right = pair.find("Right").text
-                self.tree.insert('', 'end', values=(left or "", right or ""))
+            folder_pairs = root.find("FolderPairs")
+            if folder_pairs is not None:
+                for pair in folder_pairs.findall("Pair"):
+                    left = pair.find("Left").text or ""
+                    right = pair.find("Right").text or ""
+                    self.tree.insert('', 'end', values=(left, right))
+
             # Загрузка фильтров
             exclude_el = root.find("Filter/Exclude")
             if exclude_el is not None:
                 patterns = [item.text for item in exclude_el.findall("Item") if item.text]
                 self.filter_text.delete('1.0', tk.END)
                 self.filter_text.insert('1.0', '\n'.join(patterns))
+            else:
+                self.filter_text.delete('1.0', tk.END)
+
             # Загрузка режима
             mode_el = root.find("Mode")
             if mode_el is not None and mode_el.text in ("update", "mirror"):
                 self.mode_var.set(mode_el.text)
+
             self.log_message(f"Конфигурация загружена: {filepath}")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить конфигурацию:\n{e}")
+
+    def show_log_context_menu(self, event):
+        try:
+            self.log_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.log_context_menu.grab_release()
+
+    def copy_selected_log(self):
+        try:
+            selected_text = self.log_text.selection_get()
+            self.root.clipboard_clear()
+            self.root.clipboard_append(selected_text)
+        except tk.TclError:
+            # Ничего не выделено
+            pass
 
 def main():
     root = tk.Tk()
