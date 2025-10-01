@@ -4,25 +4,17 @@ name: Release EXE
 on:
   push:
     tags:
-      - 'v*'  # Запускается только при пуш-теге вида v1.0.0, v2.1 и т.д.
+      - 'v*'
 
 jobs:
   release:
     runs-on: windows-latest
     permissions:
-      contents: write  # Требуется для создания релиза
+      contents: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Чтобы получить все теги и историю
-
-      - name: Get version from tag
-        id: get_version
-        run: |
-          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-        shell: bash
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -40,24 +32,11 @@ jobs:
           cd GUI
           pyinstaller --onefile --windowed winsync.py
 
-      - name: Create ZIP with EXE
+      - name: Create ZIP with EXE (for safer download)
         run: |
-          mkdir -p release
-          cp GUI/dist/winsync.exe release/
-          7z a release/winsync-${{ steps.get_version.outputs.VERSION }}-windows.zip release/winsync.exe
-        shell: bash
-
-      - name: Create source code archive (optional, GitHub делает auto)
-        run: |
-          git archive --format=zip --output=release/source-${{ steps.get_version.outputs.VERSION }}.zip HEAD
+          7z a winsync-windows.zip GUI/dist/winsync.exe
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          name: Release ${{ steps.get_version.outputs.VERSION }}
-          tag_name: ${{ steps.get_version.outputs.VERSION }}
-          draft: false
-          prerelease: false
-          files: |
-            release/winsync-${{ steps.get_version.outputs.VERSION }}-windows.zip
-            release/source-${{ steps.get_version.outputs.VERSION }}.zip
+          files: winsync-windows.zip
