@@ -19,6 +19,7 @@ winsync.py
 - Горячими клавишами в логе (Ctrl+A, Ctrl+C)
 - Контекстным меню "Выделить всё"
 - Кнопками рядом с режимом + эмодзи-иконками
+- Опциональную статистику по объёмам (вкладка "Параметры")
 """
 import os
 import sys
@@ -36,7 +37,7 @@ from tkinter import ttk, filedialog, messagebox
 
 # --- Метаданные приложения ---
 APP_NAME = "WinSync"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 BUILD_DATE = "2025-10-01"
 CONFIG_PATH = os.path.expanduser("~/.winsync_config.ws")
 
@@ -142,11 +143,24 @@ def match_filter(path, exclude_patterns):
             return True
     return False
 
-def analyze_sync(source, destination, mode, exclude_patterns):
-    """Анализирует изменения без их применения. Возвращает список действий."""
+def analyze_sync(source, destination, mode, exclude_patterns, collect_stats=False):
+    """Анализирует изменения без их применения. Если collect_stats=True — возвращает также статистику."""
     actions = []
+    stats = {
+        'new_files': 0,
+        'updated_files': 0,
+        'deleted_files': 0,
+        'new_dirs': 0,
+        'deleted_dirs': 0,
+        'copy_bytes': 0,
+        'delete_bytes': 0,
+        'overwrite_old_bytes': 0,
+        'overwrite_new_bytes': 0,
+    }
+
     source_path = Path(normalize_path(source))
     dest_path = Path(normalize_path(destination))
+
     # Проход по источнику
     for root, dirs, files in os.walk(source_path):
         rel_path = os.path.relpath(root, source_path)
@@ -159,17 +173,32 @@ def analyze_sync(source, destination, mode, exclude_patterns):
             dst_dir_norm = normalize_path(dst_dir)
             if not os.path.exists(dst_dir_norm):
                 actions.append(('create_dir', src_dir, dst_dir))
+                if collect_stats:
+                    stats['new_dirs'] += 1
+
         files = [f for f in files if not match_filter(os.path.join(root, f), exclude_patterns)]
         for f in files:
             src_file = os.path.join(root, f)
             dst_file = os.path.join(destination, rel_path, f) if rel_path else os.path.join(destination, f)
             src_file_norm = normalize_path(src_file)
             dst_file_norm = normalize_path(dst_file)
+
+            src_stat = os.stat(src_file_norm)
             if os.path.exists(dst_file_norm):
-                if should_copy(os.stat(src_file_norm), os.stat(dst_file_norm)):
+                dst_stat = os.stat(dst_file_norm)
+                if should_copy(src_stat, dst_stat):
                     actions.append(('copy_file', src_file, dst_file))
+                    if collect_stats:
+                        stats['updated_files'] += 1
+                        stats['overwrite_old_bytes'] += dst_stat.st_size
+                        stats['overwrite_new_bytes'] += src_stat.st_size
+                        stats['copy_bytes'] += src_stat.st_size
             else:
                 actions.append(('copy_file', src_file, dst_file))
+                if collect_stats:
+                    stats['new_files'] += 1
+                    stats['copy_bytes'] += src_stat.st_size
+
     # Удаление в режиме mirror
     if mode == 'mirror' and dest_path.exists():
         for root, dirs, files in os.walk(dest_path, topdown=False):
@@ -182,13 +211,22 @@ def analyze_sync(source, destination, mode, exclude_patterns):
                     src_equiv = os.path.join(source, rel_path, f) if rel_path else os.path.join(source, f)
                     if not os.path.exists(src_equiv):
                         actions.append(('delete_file', full_path, None))
+                        if collect_stats:
+                            stats['deleted_files'] += 1
+                            stats['delete_bytes'] += os.stat(normalize_path(full_path)).st_size
             for d in dirs:
                 full_path = os.path.join(root, d)
                 if not match_filter(full_path, exclude_patterns):
                     src_equiv = os.path.join(source, rel_path, d) if rel_path else os.path.join(source, d)
                     if not os.path.exists(src_equiv):
                         actions.append(('delete_dir', full_path, None))
-    return actions
+                        if collect_stats:
+                            stats['deleted_dirs'] += 1
+
+    if collect_stats:
+        return {'actions': actions, 'stats': stats}
+    else:
+        return {'actions': actions, 'stats': None}
 
 def apply_sync(actions, progress_callback=None, log_callback=None):
     """Применяет список действий."""
@@ -287,6 +325,11 @@ class SyncApp:
         notebook.add(filter_frame, text="Фильтры")
         self.setup_filter_tab(filter_frame)
 
+        # Вкладка "Параметры"
+        settings_frame = ttk.Frame(notebook, padding="10")
+        notebook.add(settings_frame, text="Параметры")
+        self.setup_settings_tab(settings_frame)
+
         # Прогресс и лог
         self.progress = ttk.Progressbar(main_frame, orient="horizontal", mode="determinate")
         self.progress.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
@@ -378,6 +421,15 @@ class SyncApp:
         self.filter_text.configure(yscrollcommand=vsb.set)
         self.filter_text.insert('1.0', '\n'.join(self.exclude_patterns))
 
+    def setup_settings_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        self.stats_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            parent,
+            text="Показывать подробную статистику при сравнении (замедляет анализ)",
+            variable=self.stats_enabled
+        ).grid(row=0, column=0, sticky=tk.W, pady=5)
+
     def add_pair(self):
         src = filedialog.askdirectory(title="Выберите исходную папку")
         if not src:
@@ -447,6 +499,17 @@ class SyncApp:
         self.compare_btn.config(state=state)
         self.sync_btn.config(state=state)
 
+    def human_readable_size(self, num_bytes):
+        if num_bytes == 0:
+            return "0 Б"
+        units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ']
+        size = float(num_bytes)
+        for unit in units:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} ПБ"
+
     # ============ СРАВНЕНИЕ ============
     def compare_sync(self):
         pairs = self.get_active_pairs()
@@ -468,35 +531,91 @@ class SyncApp:
 
     def _background_compare(self, pairs, exclude_patterns):
         all_actions = []
+        total_stats = {
+            'new_files': 0,
+            'updated_files': 0,
+            'deleted_files': 0,
+            'new_dirs': 0,
+            'deleted_dirs': 0,
+            'copy_bytes': 0,
+            'delete_bytes': 0,
+            'overwrite_old_bytes': 0,
+            'overwrite_new_bytes': 0,
+        }
         batch = []
         def flush_batch():
             if batch:
                 self.root.after(0, lambda b=batch.copy(): self._log_batch(b))
                 batch.clear()
+
+        collect_stats = self.stats_enabled.get()
+
         for src, dst in pairs:
             if not os.path.exists(src):
                 self.root.after(0, lambda s=src: self.log_message(f"⚠️ Исходная папка не существует: {s}"))
                 continue
             try:
-                actions = analyze_sync(src, dst, self.mode_var.get(), exclude_patterns)
+                result = analyze_sync(src, dst, self.mode_var.get(), exclude_patterns, collect_stats=collect_stats)
+                actions = result['actions']
+                pair_stats = result['stats']
+
                 for act in actions:
                     batch.append(act)
                     if len(batch) >= 200:
                         flush_batch()
                 flush_batch()
                 all_actions.extend(actions)
+
+                if collect_stats and pair_stats:
+                    for k in total_stats:
+                        total_stats[k] += pair_stats[k]
+
             except Exception as e:
                 self.root.after(0, lambda e=e: self.log_message(f"❌ Ошибка анализа пары: {e}"))
-        self.root.after(0, lambda: self._compare_finished(len(all_actions)))
 
-    def _compare_finished(self, total_actions):
+        self.root.after(0, lambda: self._compare_finished(len(all_actions), total_stats if collect_stats else None))
+
+    def _compare_finished(self, total_actions, stats=None):
         self.progress.stop()
         self.progress['mode'] = 'determinate'
         self.progress.grid_remove()
+
         if total_actions == 0:
             self.log_message("Нет изменений для синхронизации.")
         else:
             self.log_message(f"\nВсего операций: {total_actions}")
+
+        # Вывод статистики, если включена
+        if stats and any(stats.values()):
+            hr = self.human_readable_size
+            summary = ["\n📊 Подробная статистика:"]
+            if stats['new_files'] > 0:
+                new_files_bytes = stats['copy_bytes'] - stats['overwrite_new_bytes']
+                summary.append(f"Новые файлы: {stats['new_files']} ({hr(new_files_bytes)})")
+            if stats['updated_files'] > 0:
+                old_sz = stats['overwrite_old_bytes']
+                new_sz = stats['overwrite_new_bytes']
+                diff = new_sz - old_sz
+                sign = '+' if diff >= 0 else ''
+                summary.append(f"Обновлённые файлы: {stats['updated_files']} "
+                               f"(было: {hr(old_sz)} → станет: {hr(new_sz)}, {sign}{hr(diff)})")
+            if stats['deleted_files'] > 0:
+                summary.append(f"Удаляемые файлы: {stats['deleted_files']} ({hr(stats['delete_bytes'])})")
+            if stats['new_dirs'] > 0:
+                summary.append(f"Новые папки: {stats['new_dirs']}")
+            if stats['deleted_dirs'] > 0:
+                summary.append(f"Удаляемые папки: {stats['deleted_dirs']}")
+
+            total_copy = stats['copy_bytes']
+            total_del = stats['delete_bytes']
+            net_change = total_copy - total_del
+            summary.append(f"Итого к копированию: {hr(total_copy)}")
+            summary.append(f"Итого к удалению: {hr(total_del)}")
+            summary.append(f"Чистый прирост: {'+' if net_change >= 0 else ''}{hr(net_change)}")
+
+            for line in summary:
+                self.log_message(line)
+
         self.set_ui_enabled(True)
 
     # ============ СИНХРОНИЗАЦИЯ ============
@@ -523,8 +642,8 @@ class SyncApp:
                 self.root.after(0, lambda s=src: self.log_message(f"⚠️ Исходная папка не существует: {s}"))
                 continue
             try:
-                actions = analyze_sync(src, dst, self.mode_var.get(), exclude_patterns)
-                all_actions.extend(actions)
+                actions = analyze_sync(src, dst, self.mode_var.get(), exclude_patterns, collect_stats=False)
+                all_actions.extend(actions['actions'])
             except Exception as e:
                 self.root.after(0, lambda e=e: self.log_message(f"❌ Ошибка анализа перед синхронизацией: {e}"))
         if all_actions:
@@ -598,11 +717,9 @@ class SyncApp:
         try:
             tree = ET.parse(filepath)
             root = tree.getroot()
-
             # Очистка текущих пар
             for item in self.tree.get_children():
                 self.tree.delete(item)
-
             # Загрузка пар
             folder_pairs = root.find("FolderPairs")
             if folder_pairs is not None:
@@ -612,7 +729,6 @@ class SyncApp:
                     left = pair.find("Left").text or ""
                     right = pair.find("Right").text or ""
                     self.tree.insert('', 'end', values=(enabled, left, right))
-
             # Загрузка фильтров
             exclude_el = root.find("Filter/Exclude")
             if exclude_el is not None:
@@ -621,7 +737,6 @@ class SyncApp:
                 self.filter_text.insert('1.0', '\n'.join(patterns))
             else:
                 self.filter_text.delete('1.0', tk.END)
-
             # Загрузка режима
             mode_el = root.find("Mode")
             if mode_el is not None and mode_el.text in ("update", "mirror"):
@@ -647,7 +762,6 @@ class SyncApp:
     def show_about(self):
         about_text = f"""{APP_NAME} v{APP_VERSION}
 Дата сборки: {BUILD_DATE}
-
 Скрипт синхронизации с GUI на основе tkinter.
 Поддерживает:
 - Множественные пары папок с включением/отключением
@@ -659,14 +773,13 @@ class SyncApp:
 - Копирование ACL и альтернативных потоков данных (ADS)
 - Поддержку длинных путей (>260 символов)
 - Логирование в реальном времени
-
+- Опциональную статистику по объёмам
 Используемые технологии:
 - Python 3.x
 - tkinter (GUI)
 - win32security / win32file (NTFS ACL, ADS)
 - send2trash (опционально, для корзины)
 - threading (фоновые операции)
-
 © 2025 Пользователь Windows
 """
         messagebox.showinfo("О программе", about_text)
@@ -699,12 +812,10 @@ class SyncApp:
     def copy_selected_log(self):
         self.copy_selected_log_shortcut()
 
-
 def main():
     root = tk.Tk()
     app = SyncApp(root)
     root.mainloop()
-
 
 if __name__ == '__main__':
     main()
