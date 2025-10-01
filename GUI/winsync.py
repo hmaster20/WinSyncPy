@@ -20,6 +20,7 @@ winsync.py
 - Контекстным меню "Выделить всё"
 - Кнопками рядом с режимом + эмодзи-иконками
 - Опциональную статистику по объёмам (вкладка "Параметры")
+- Отказоустойчивое копирование через временные файлы (.ws_tmp)
 """
 import os
 import sys
@@ -37,8 +38,8 @@ from tkinter import ttk, filedialog, messagebox
 
 # --- Метаданные приложения ---
 APP_NAME = "WinSync"
-APP_VERSION = "1.4.0"
-BUILD_DATE = "2025-10-01"
+APP_VERSION = "1.5.0"
+BUILD_DATE = "2025-10-02"
 CONFIG_PATH = os.path.expanduser("~/.winsync_config.ws")
 
 # --- Поддержка корзины ---
@@ -229,7 +230,7 @@ def analyze_sync(source, destination, mode, exclude_patterns, collect_stats=Fals
         return {'actions': actions, 'stats': None}
 
 def apply_sync(actions, progress_callback=None, log_callback=None):
-    """Применяет список действий."""
+    """Применяет список действий с отказоустойчивым копированием."""
     global ERRORS
     ERRORS = []
     total = len(actions)
@@ -241,12 +242,30 @@ def apply_sync(actions, progress_callback=None, log_callback=None):
                 if log_callback:
                     log_callback('create_dir', src, dst)
             elif action == 'copy_file':
-                os.makedirs(os.path.dirname(normalize_path(dst)), exist_ok=True)
-                shutil.copy2(normalize_path(src), normalize_path(dst))
-                copy_acl(normalize_path(src), normalize_path(dst))
-                copy_ads(normalize_path(src), normalize_path(dst))
-                if log_callback:
-                    log_callback('copy_file', src, dst)
+                src_norm = normalize_path(src)
+                dst_norm = normalize_path(dst)
+                dst_dir = os.path.dirname(dst_norm)
+                os.makedirs(dst_dir, exist_ok=True)
+
+                # Временный файл в той же папке
+                dst_stem = os.path.splitext(dst_norm)[0]
+                dst_ext = os.path.splitext(dst_norm)[1]
+                tmp_dst = f"{dst_stem}.ws_tmp{dst_ext}"
+
+                try:
+                    shutil.copy2(src_norm, tmp_dst)
+                    copy_acl(src_norm, tmp_dst)
+                    copy_ads(src_norm, tmp_dst)
+                    os.replace(tmp_dst, dst_norm)  # Атомарная замена
+                    if log_callback:
+                        log_callback('copy_file', src, dst)
+                except Exception as e:
+                    if os.path.exists(tmp_dst):
+                        try:
+                            os.remove(tmp_dst)
+                        except:
+                            pass
+                    raise e
             elif action == 'delete_file':
                 if SEND2TRASH_AVAILABLE:
                     send2trash(normalize_path(src))
@@ -335,7 +354,7 @@ class SyncApp:
         self.progress.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         self.progress.grid_remove()
 
-        self.log_text = tk.Text(main_frame, height=10, state='disabled', wrap='none')
+        self.log_text = tk.Text(main_frame, height=10, state='disabled', wrap='none', exportselection=False)
         self.log_text.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         vsb = ttk.Scrollbar(main_frame, orient="vertical", command=self.log_text.yview)
         vsb.grid(row=2, column=1, sticky=(tk.N, tk.S))
@@ -344,7 +363,7 @@ class SyncApp:
         self.log_text.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.log_text.grid_remove()
 
-        # Горячие клавиши
+        # Горячие клавиши — регистрируем ДО блокировки
         self.log_text.bind("<Control-a>", self.select_all_log)
         self.log_text.bind("<Control-c>", self.copy_selected_log_shortcut)
 
@@ -500,15 +519,18 @@ class SyncApp:
         self.sync_btn.config(state=state)
 
     def human_readable_size(self, num_bytes):
+        """Преобразует байты в человекочитаемый формат. Поддерживает отрицательные значения."""
         if num_bytes == 0:
             return "0 Б"
+        sign = "-" if num_bytes < 0 else ""
+        num_bytes = abs(num_bytes)
         units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ']
         size = float(num_bytes)
         for unit in units:
             if size < 1024.0:
-                return f"{size:.1f} {unit}"
+                return f"{sign}{size:.1f} {unit}"
             size /= 1024.0
-        return f"{size:.1f} ПБ"
+        return f"{sign}{size:.1f} ПБ"
 
     # ============ СРАВНЕНИЕ ============
     def compare_sync(self):
@@ -596,9 +618,8 @@ class SyncApp:
                 old_sz = stats['overwrite_old_bytes']
                 new_sz = stats['overwrite_new_bytes']
                 diff = new_sz - old_sz
-                sign = '+' if diff >= 0 else ''
                 summary.append(f"Обновлённые файлы: {stats['updated_files']} "
-                               f"(было: {hr(old_sz)} → станет: {hr(new_sz)}, {sign}{hr(diff)})")
+                               f"(было: {hr(old_sz)} → станет: {hr(new_sz)}, {hr(diff)})")
             if stats['deleted_files'] > 0:
                 summary.append(f"Удаляемые файлы: {stats['deleted_files']} ({hr(stats['delete_bytes'])})")
             if stats['new_dirs'] > 0:
@@ -611,7 +632,7 @@ class SyncApp:
             net_change = total_copy - total_del
             summary.append(f"Итого к копированию: {hr(total_copy)}")
             summary.append(f"Итого к удалению: {hr(total_del)}")
-            summary.append(f"Чистый прирост: {'+' if net_change >= 0 else ''}{hr(net_change)}")
+            summary.append(f"Чистый прирост: {hr(net_change)}")
 
             for line in summary:
                 self.log_message(line)
@@ -774,6 +795,7 @@ class SyncApp:
 - Поддержку длинных путей (>260 символов)
 - Логирование в реальном времени
 - Опциональную статистику по объёмам
+- Отказоустойчивое копирование через временные файлы
 Используемые технологии:
 - Python 3.x
 - tkinter (GUI)
@@ -792,11 +814,9 @@ class SyncApp:
             self.log_context_menu.grab_release()
 
     def select_all_log(self, event=None):
-        self.log_text.configure(state='normal')
         self.log_text.tag_add(tk.SEL, "1.0", tk.END)
         self.log_text.mark_set(tk.INSERT, "1.0")
         self.log_text.see(tk.INSERT)
-        self.log_text.configure(state='disabled')
         return "break"
 
     def copy_selected_log_shortcut(self, event=None):
