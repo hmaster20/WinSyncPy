@@ -1,36 +1,63 @@
-# .github/workflows/build.yml
-name: Build EXE
+# .github/workflows/release.yml
+name: Release EXE
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
+    tags:
+      - 'v*'  # Запускается только при пуш-теге вида v1.0.0, v2.1 и т.д.
 
 jobs:
-  build-windows:
+  release:
     runs-on: windows-latest
+    permissions:
+      contents: write  # Требуется для создания релиза
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Чтобы получить все теги и историю
+
+      - name: Get version from tag
+        id: get_version
+        run: |
+          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        shell: bash
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies from GUI/requirements.txt
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller
           pip install -r GUI/requirements.txt
 
-      - name: Build executable from GUI/winsync.py
+      - name: Build executable
         run: |
           cd GUI
           pyinstaller --onefile --windowed winsync.py
 
-      - name: Upload EXE as artifact
-        uses: actions/upload-artifact@v4
+      - name: Create ZIP with EXE
+        run: |
+          mkdir -p release
+          cp GUI/dist/winsync.exe release/
+          7z a release/winsync-${{ steps.get_version.outputs.VERSION }}-windows.zip release/winsync.exe
+        shell: bash
+
+      - name: Create source code archive (optional, GitHub делает auto)
+        run: |
+          git archive --format=zip --output=release/source-${{ steps.get_version.outputs.VERSION }}.zip HEAD
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: winsync-windows
-          path: GUI/dist/
+          name: Release ${{ steps.get_version.outputs.VERSION }}
+          tag_name: ${{ steps.get_version.outputs.VERSION }}
+          draft: false
+          prerelease: false
+          files: |
+            release/winsync-${{ steps.get_version.outputs.VERSION }}-windows.zip
+            release/source-${{ steps.get_version.outputs.VERSION }}.zip
