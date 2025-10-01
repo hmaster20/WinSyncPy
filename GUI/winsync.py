@@ -4,19 +4,20 @@
 winsync.py
 Скрипт синхронизации с GUI на основе tkinter.
 Поддерживает:
-- Множественные пары папок
-- Фильтрацию (исключения)
+- Множественные пары папок с включением/отключением (чекбоксы)
+- Фильтрацию (исключения по маске)
 - Предварительное сравнение (dry-run)
 - Сохранение/загрузку конфигурации в XML (*.ws)
 - Удаление в корзину (требуется Send2Trash)
+- Копирование ACL и альтернативных потоков данных (ADS)
+- Поддержка длинных путей (>260 символов)
+- Логирование в реальном времени
+- Автосохранение настроек
 - Контекстное меню копирования в логе
 - Режим синхронизации в вкладке "Пары папок"
-- Чекбоксами для пар папок
-- Фоновым сравнением и синхронизацией
-- Логированием в реальном времени
+- Фоновое сравнение и синхронизацией
 - Горячими клавишами в логе (Ctrl+A, Ctrl+C)
 - Контекстным меню "Выделить всё"
-- Автосохранением настроек при выходе
 - Кнопками рядом с режимом + эмодзи-иконками
 """
 import os
@@ -33,7 +34,13 @@ import pywintypes
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# Попытка импорта Send2Trash для корзины
+# --- Метаданные приложения ---
+APP_NAME = "WinSync"
+APP_VERSION = "1.3.0"
+BUILD_DATE = "2025-10-01"
+CONFIG_PATH = os.path.expanduser("~/.winsync_config.ws")
+
+# --- Поддержка корзины ---
 try:
     from send2trash import send2trash
     SEND2TRASH_AVAILABLE = True
@@ -43,15 +50,19 @@ except ImportError:
 # --- Глобальные переменные ---
 ERRORS = []
 ERRORS_LOCK = threading.Lock()
-CONFIG_PATH = os.path.expanduser("~/.winsync_config.ws")
-
 
 # --- Вспомогательные функции ---
 def normalize_path(path):
-    """Нормализует путь для поддержки длинных имен."""
+    """Добавляет префикс \\?\ для поддержки длинных путей (длиннее 260 символов)."""
     path = os.path.abspath(path)
     if not path.startswith('\\\\?\\'):
         path = '\\\\?\\' + path
+    return path
+
+def denormalize_path(path):
+    """Убирает префикс \\?\ для отображения пользователю."""
+    if path.startswith('\\\\?\\'):
+        return path[4:]
     return path
 
 def get_file_streams(filepath):
@@ -218,7 +229,6 @@ def apply_sync(actions, progress_callback=None, log_callback=None):
         if progress_callback:
             progress_callback(i, total)
 
-
 # --- Класс приложения ---
 class SyncApp:
     def __init__(self, root):
@@ -258,7 +268,11 @@ class SyncApp:
         file_menu.add_separator()
         file_menu.add_command(label="Выход", command=self.root.quit)
 
-        # Notebook (вкладки)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Справка", menu=help_menu)
+        help_menu.add_command(label="О программе", command=self.show_about)
+
+        # Вкладки
         notebook = ttk.Notebook(main_frame)
         notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         main_frame.rowconfigure(0, weight=1)
@@ -280,11 +294,11 @@ class SyncApp:
 
         self.log_text = tk.Text(main_frame, height=10, state='disabled', wrap='none')
         self.log_text.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
-        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=self.log_text.yview)
-        scrollbar.grid(row=2, column=1, sticky=(tk.N, tk.S))
-        hscroll = ttk.Scrollbar(main_frame, orient="horizontal", command=self.log_text.xview)
-        hscroll.grid(row=3, column=0, sticky=(tk.W, tk.E))
-        self.log_text.configure(yscrollcommand=scrollbar.set, xscrollcommand=hscroll.set)
+        vsb = ttk.Scrollbar(main_frame, orient="vertical", command=self.log_text.yview)
+        vsb.grid(row=2, column=1, sticky=(tk.N, tk.S))
+        hsb = ttk.Scrollbar(main_frame, orient="horizontal", command=self.log_text.xview)
+        hsb.grid(row=3, column=0, sticky=(tk.W, tk.E))
+        self.log_text.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.log_text.grid_remove()
 
         # Горячие клавиши
@@ -341,7 +355,6 @@ class SyncApp:
         vsb = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
         vsb.grid(row=2, column=1, sticky=(tk.N, tk.S))
         self.tree.configure(yscrollcommand=vsb.set)
-
         self.tree.bind('<Button-1>', self.on_tree_click)
 
     def on_tree_click(self, event):
@@ -398,15 +411,31 @@ class SyncApp:
         self.log_text.see(tk.END)
 
     def _log_action(self, action, src, dst):
-        basename = os.path.basename(src if action in ('delete_file', 'delete_dir') else dst)
+        src_clean = denormalize_path(src)
+        dst_clean = denormalize_path(dst) if dst else ""
+        basename = os.path.basename(src_clean if action in ('delete_file', 'delete_dir') else dst_clean)
         if action == 'copy_file':
-            self.log_message(f"→ Копирую: {basename}")
+            self.log_message(f"→ Копирую: {basename} ({src_clean} → {dst_clean})")
         elif action == 'create_dir':
-            self.log_message(f"📁 Создаю папку: {basename}")
+            self.log_message(f"📁 Создаю папку: {dst_clean}")
         elif action == 'delete_file':
-            self.log_message(f"× Удаляю файл: {basename}")
+            self.log_message(f"× Удаляю файл: {src_clean}")
         elif action == 'delete_dir':
-            self.log_message(f"🗑 Удаляю папку: {basename}")
+            self.log_message(f"🗑 Удаляю папку: {src_clean}")
+
+    def _log_batch(self, batch):
+        for act in batch:
+            op, s, d = act
+            s_clean = denormalize_path(s)
+            d_clean = denormalize_path(d) if d else ""
+            if op == 'copy_file':
+                self.log_message(f"→ Копировать: {s_clean} → {d_clean}")
+            elif op == 'create_dir':
+                self.log_message(f"📁 Создать папку: {d_clean}")
+            elif op == 'delete_file':
+                self.log_message(f"× Удалить файл: {s_clean}")
+            elif op == 'delete_dir':
+                self.log_message(f"🗑 Удалить папку: {s_clean}")
 
     def update_progress(self, current, total):
         if total > 0:
@@ -459,18 +488,6 @@ class SyncApp:
             except Exception as e:
                 self.root.after(0, lambda e=e: self.log_message(f"❌ Ошибка анализа пары: {e}"))
         self.root.after(0, lambda: self._compare_finished(len(all_actions)))
-
-    def _log_batch(self, batch):
-        for act in batch:
-            op, s, d = act
-            if op == 'copy_file':
-                self.log_message(f"→ Копировать: {s} → {d}")
-            elif op == 'create_dir':
-                self.log_message(f"📁 Создать папку: {d}")
-            elif op == 'delete_file':
-                self.log_message(f"× Удалить файл: {s}")
-            elif op == 'delete_dir':
-                self.log_message(f"🗑 Удалить папку: {s}")
 
     def _compare_finished(self, total_actions):
         self.progress.stop()
@@ -626,7 +643,35 @@ class SyncApp:
             self._write_config(CONFIG_PATH, pairs)
         self.root.destroy()
 
-    # ============ CONTEXT MENU & HOTKEYS ============
+    # ============ СПРАВКА ============
+    def show_about(self):
+        about_text = f"""{APP_NAME} v{APP_VERSION}
+Дата сборки: {BUILD_DATE}
+
+Скрипт синхронизации с GUI на основе tkinter.
+Поддерживает:
+- Множественные пары папок с включением/отключением
+- Фильтрацию (исключения по маске)
+- Предварительное сравнение (dry-run)
+- Режимы: «Обновление» и «Зеркало»
+- Сохранение/загрузку конфигурации в XML (*.ws)
+- Удаление файлов в корзину (требуется Send2Trash)
+- Копирование ACL и альтернативных потоков данных (ADS)
+- Поддержку длинных путей (>260 символов)
+- Логирование в реальном времени
+
+Используемые технологии:
+- Python 3.x
+- tkinter (GUI)
+- win32security / win32file (NTFS ACL, ADS)
+- send2trash (опционально, для корзины)
+- threading (фоновые операции)
+
+© 2025 Пользователь Windows
+"""
+        messagebox.showinfo("О программе", about_text)
+
+    # ============ КОНТЕКСТНОЕ МЕНЮ И ГОРЯЧИЕ КЛАВИШИ ============
     def show_log_context_menu(self, event):
         try:
             self.log_context_menu.tk_popup(event.x_root, event.y_root)
