@@ -14,6 +14,10 @@ winsync.py
 - Чекбоксами для пар папок
 - Фоновым сравнением и синхронизацией
 - Логированием в реальном времени
+- Горячими клавишами в логе (Ctrl+A, Ctrl+C)
+- Контекстным меню "Выделить всё"
+- Автосохранением настроек при выходе
+- Кнопками рядом с режимом + эмодзи-иконками
 """
 import os
 import sys
@@ -39,6 +43,8 @@ except ImportError:
 # --- Глобальные переменные ---
 ERRORS = []
 ERRORS_LOCK = threading.Lock()
+CONFIG_PATH = os.path.expanduser("~/.winsync_config.ws")
+
 
 # --- Вспомогательные функции ---
 def normalize_path(path):
@@ -212,6 +218,7 @@ def apply_sync(actions, progress_callback=None, log_callback=None):
         if progress_callback:
             progress_callback(i, total)
 
+
 # --- Класс приложения ---
 class SyncApp:
     def __init__(self, root):
@@ -228,7 +235,8 @@ class SyncApp:
             r'.*\\thumbs\.db$'
         ]
         self.create_widgets()
-        self.ui_enabled = True
+        self.load_auto_config()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def create_widgets(self):
         style = ttk.Style()
@@ -265,32 +273,31 @@ class SyncApp:
         notebook.add(filter_frame, text="Фильтры")
         self.setup_filter_tab(filter_frame)
 
-        # Кнопки управления
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.grid(row=1, column=0, pady=10)
-        self.compare_btn = ttk.Button(btn_frame, text="Сравнить", command=self.compare_sync)
-        self.compare_btn.pack(side=tk.LEFT, padx=5)
-        self.sync_btn = ttk.Button(btn_frame, text="Запустить синхронизацию", command=self.start_sync)
-        self.sync_btn.pack(side=tk.LEFT, padx=5)
-
         # Прогресс и лог
         self.progress = ttk.Progressbar(main_frame, orient="horizontal", mode="determinate")
-        self.progress.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        self.progress.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         self.progress.grid_remove()
 
-        self.log_text = tk.Text(main_frame, height=10, state='disabled')
-        self.log_text.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        self.log_text = tk.Text(main_frame, height=10, state='disabled', wrap='none')
+        self.log_text.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=self.log_text.yview)
-        scrollbar.grid(row=3, column=1, sticky=(tk.N, tk.S))
-        self.log_text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.grid(row=2, column=1, sticky=(tk.N, tk.S))
+        hscroll = ttk.Scrollbar(main_frame, orient="horizontal", command=self.log_text.xview)
+        hscroll.grid(row=3, column=0, sticky=(tk.W, tk.E))
+        self.log_text.configure(yscrollcommand=scrollbar.set, xscrollcommand=hscroll.set)
         self.log_text.grid_remove()
+
+        # Горячие клавиши
+        self.log_text.bind("<Control-a>", self.select_all_log)
+        self.log_text.bind("<Control-c>", self.copy_selected_log_shortcut)
 
         # Контекстное меню для лога
         self.log_context_menu = tk.Menu(self.log_text, tearoff=0)
+        self.log_context_menu.add_command(label="Выделить всё", command=self.select_all_log)
         self.log_context_menu.add_command(label="Копировать", command=self.copy_selected_log)
         self.log_text.bind("<Button-3>", self.show_log_context_menu)
 
-        main_frame.rowconfigure(3, weight=1)
+        main_frame.rowconfigure(2, weight=1)
 
     def setup_pairs_tab(self, parent):
         parent.columnconfigure(0, weight=1)
@@ -299,18 +306,27 @@ class SyncApp:
         # Кнопки и режим синхронизации
         top_frame = ttk.Frame(parent)
         top_frame.grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
+
         btn_frame = ttk.Frame(top_frame)
         btn_frame.pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="Добавить пару", command=self.add_pair).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(btn_frame, text="Удалить выбранное", command=self.remove_pair).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="Удалить пару", command=self.remove_pair).pack(side=tk.LEFT)
 
         # Режим синхронизации
         mode_frame = ttk.Frame(top_frame)
-        mode_frame.pack(side=tk.RIGHT)
+        mode_frame.pack(side=tk.LEFT, padx=(20, 0))
         ttk.Label(mode_frame, text="Режим:").pack(side=tk.LEFT)
         self.mode_var = tk.StringVar(value="update")
         ttk.Radiobutton(mode_frame, text="Обновление", variable=self.mode_var, value="update").pack(side=tk.LEFT, padx=(5, 10))
         ttk.Radiobutton(mode_frame, text="Зеркало", variable=self.mode_var, value="mirror").pack(side=tk.LEFT, padx=(0, 10))
+
+        # Кнопки управления
+        btn_frame2 = ttk.Frame(top_frame)
+        btn_frame2.pack(side=tk.LEFT, padx=(20, 0))
+        self.compare_btn = ttk.Button(btn_frame2, text="🔍 Сравнить", command=self.compare_sync)
+        self.compare_btn.pack(side=tk.LEFT, padx=5)
+        self.sync_btn = ttk.Button(btn_frame2, text="🔄 Синхронизировать", command=self.start_sync)
+        self.sync_btn.pack(side=tk.LEFT, padx=5)
 
         # Treeview для пар
         columns = ('enabled', 'source', 'dest')
@@ -401,7 +417,6 @@ class SyncApp:
         state = 'normal' if enabled else 'disabled'
         self.compare_btn.config(state=state)
         self.sync_btn.config(state=state)
-        self.ui_enabled = enabled
 
     # ============ СРАВНЕНИЕ ============
     def compare_sync(self):
@@ -409,7 +424,6 @@ class SyncApp:
         if not pairs:
             messagebox.showerror("Ошибка", "Добавьте хотя бы одну активную пару папок.")
             return
-
         exclude_patterns = self.get_filters()
         self.log_text.grid()
         self.log_text.configure(state='normal')
@@ -420,19 +434,16 @@ class SyncApp:
         self.progress['mode'] = 'indeterminate'
         self.progress.start()
         self.set_ui_enabled(False)
-
         thread = threading.Thread(target=self._background_compare, args=(pairs, exclude_patterns), daemon=True)
         thread.start()
 
     def _background_compare(self, pairs, exclude_patterns):
         all_actions = []
         batch = []
-
         def flush_batch():
             if batch:
                 self.root.after(0, lambda b=batch.copy(): self._log_batch(b))
                 batch.clear()
-
         for src, dst in pairs:
             if not os.path.exists(src):
                 self.root.after(0, lambda s=src: self.log_message(f"⚠️ Исходная папка не существует: {s}"))
@@ -447,7 +458,6 @@ class SyncApp:
                 all_actions.extend(actions)
             except Exception as e:
                 self.root.after(0, lambda e=e: self.log_message(f"❌ Ошибка анализа пары: {e}"))
-
         self.root.after(0, lambda: self._compare_finished(len(all_actions)))
 
     def _log_batch(self, batch):
@@ -478,7 +488,6 @@ class SyncApp:
         if not pairs:
             messagebox.showerror("Ошибка", "Добавьте хотя бы одну активную пару папок.")
             return
-
         exclude_patterns = self.get_filters()
         self.log_text.grid()
         self.log_text.configure(state='normal')
@@ -487,7 +496,6 @@ class SyncApp:
         self.progress.grid()
         self.progress['value'] = 0
         self.set_ui_enabled(False)
-
         thread = threading.Thread(target=self._background_sync, args=(pairs, exclude_patterns), daemon=True)
         thread.start()
 
@@ -502,7 +510,6 @@ class SyncApp:
                 all_actions.extend(actions)
             except Exception as e:
                 self.root.after(0, lambda e=e: self.log_message(f"❌ Ошибка анализа перед синхронизацией: {e}"))
-
         if all_actions:
             apply_sync(
                 all_actions,
@@ -532,7 +539,6 @@ class SyncApp:
         if not any(enabled == "✔" for enabled, _, _ in pairs):
             messagebox.showwarning("Предупреждение", "Нет активных пар для сохранения.")
             return
-
         initial_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         filepath = filedialog.asksaveasfilename(
             initialdir=initial_dir,
@@ -541,7 +547,9 @@ class SyncApp:
         )
         if not filepath:
             return
+        self._write_config(filepath, pairs)
 
+    def _write_config(self, filepath, pairs):
         root = ET.Element("SyncConfig")
         pairs_el = ET.SubElement(root, "FolderPairs")
         for enabled, src, dst in pairs:
@@ -549,15 +557,12 @@ class SyncApp:
             ET.SubElement(pair, "Enabled").text = enabled
             ET.SubElement(pair, "Left").text = src
             ET.SubElement(pair, "Right").text = dst
-
         filter_el = ET.SubElement(root, "Filter")
         exclude_el = ET.SubElement(filter_el, "Exclude")
         for pat in self.get_filters():
             ET.SubElement(exclude_el, "Item").text = pat
-
         mode_el = ET.SubElement(root, "Mode")
         mode_el.text = self.mode_var.get()
-
         tree = ET.ElementTree(root)
         tree.write(filepath, encoding='utf-8', xml_declaration=True)
         self.log_message(f"Конфигурация сохранена: {filepath}")
@@ -570,7 +575,9 @@ class SyncApp:
         )
         if not filepath:
             return
+        self._load_config_file(filepath)
 
+    def _load_config_file(self, filepath):
         try:
             tree = ET.parse(filepath)
             root = tree.getroot()
@@ -602,19 +609,39 @@ class SyncApp:
             mode_el = root.find("Mode")
             if mode_el is not None and mode_el.text in ("update", "mirror"):
                 self.mode_var.set(mode_el.text)
-
             self.log_message(f"Конфигурация загружена: {filepath}")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить конфигурацию:\n{e}")
 
-    # ============ CONTEXT MENU ============
+    def load_auto_config(self):
+        if os.path.exists(CONFIG_PATH):
+            self._load_config_file(CONFIG_PATH)
+
+    def on_closing(self):
+        pairs = []
+        for item in self.tree.get_children():
+            enabled, src, dst = self.tree.item(item, 'values')
+            pairs.append((enabled, src, dst))
+        if pairs:
+            self._write_config(CONFIG_PATH, pairs)
+        self.root.destroy()
+
+    # ============ CONTEXT MENU & HOTKEYS ============
     def show_log_context_menu(self, event):
         try:
             self.log_context_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.log_context_menu.grab_release()
 
-    def copy_selected_log(self):
+    def select_all_log(self, event=None):
+        self.log_text.configure(state='normal')
+        self.log_text.tag_add(tk.SEL, "1.0", tk.END)
+        self.log_text.mark_set(tk.INSERT, "1.0")
+        self.log_text.see(tk.INSERT)
+        self.log_text.configure(state='disabled')
+        return "break"
+
+    def copy_selected_log_shortcut(self, event=None):
         try:
             selected_text = self.log_text.selection_get()
             self.root.clipboard_clear()
@@ -622,11 +649,17 @@ class SyncApp:
         except tk.TclError:
             # Ничего не выделено
             pass
+        return "break"
+
+    def copy_selected_log(self):
+        self.copy_selected_log_shortcut()
+
 
 def main():
     root = tk.Tk()
     app = SyncApp(root)
     root.mainloop()
+
 
 if __name__ == '__main__':
     main()
