@@ -20,7 +20,7 @@ winsync.py
 - Контекстным меню "Выделить всё"
 - Кнопками рядом с режимом + эмодзи-иконками
 - Опциональную статистику по объёмам (вкладка "Параметры")
-- Отказоустойчивое копирование через временные файлы (.ws_tmp)
+- Отказоустойчивое копирование через временные файлы (.ws_tmp) — опционально, включено по умолчанию
 """
 import os
 import sys
@@ -38,7 +38,7 @@ from tkinter import ttk, filedialog, messagebox
 
 # --- Метаданные приложения ---
 APP_NAME = "WinSync"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 BUILD_DATE = "2025-10-02"
 CONFIG_PATH = os.path.expanduser("~/.winsync_config.ws")
 
@@ -229,8 +229,8 @@ def analyze_sync(source, destination, mode, exclude_patterns, collect_stats=Fals
     else:
         return {'actions': actions, 'stats': None}
 
-def apply_sync(actions, progress_callback=None, log_callback=None):
-    """Применяет список действий с отказоустойчивым копированием."""
+def apply_sync(actions, progress_callback=None, log_callback=None, use_safe_copy=True):
+    """Применяет список действий с опциональным отказоустойчивым копированием."""
     global ERRORS
     ERRORS = []
     total = len(actions)
@@ -247,25 +247,32 @@ def apply_sync(actions, progress_callback=None, log_callback=None):
                 dst_dir = os.path.dirname(dst_norm)
                 os.makedirs(dst_dir, exist_ok=True)
 
-                # Временный файл в той же папке
-                dst_stem = os.path.splitext(dst_norm)[0]
-                dst_ext = os.path.splitext(dst_norm)[1]
-                tmp_dst = f"{dst_stem}.ws_tmp{dst_ext}"
-
-                try:
-                    shutil.copy2(src_norm, tmp_dst)
-                    copy_acl(src_norm, tmp_dst)
-                    copy_ads(src_norm, tmp_dst)
-                    os.replace(tmp_dst, dst_norm)  # Атомарная замена
+                if use_safe_copy:
+                    # Отказоустойчивое копирование
+                    dst_stem = os.path.splitext(dst_norm)[0]
+                    dst_ext = os.path.splitext(dst_norm)[1]
+                    tmp_dst = f"{dst_stem}.ws_tmp{dst_ext}"
+                    try:
+                        shutil.copy2(src_norm, tmp_dst)
+                        copy_acl(src_norm, tmp_dst)
+                        copy_ads(src_norm, tmp_dst)
+                        os.replace(tmp_dst, dst_norm)
+                        if log_callback:
+                            log_callback('copy_file', src, dst)
+                    except Exception as e:
+                        if os.path.exists(tmp_dst):
+                            try:
+                                os.remove(tmp_dst)
+                            except:
+                                pass
+                        raise e
+                else:
+                    # Простое копирование
+                    shutil.copy2(src_norm, dst_norm)
+                    copy_acl(src_norm, dst_norm)
+                    copy_ads(src_norm, dst_norm)
                     if log_callback:
                         log_callback('copy_file', src, dst)
-                except Exception as e:
-                    if os.path.exists(tmp_dst):
-                        try:
-                            os.remove(tmp_dst)
-                        except:
-                            pass
-                    raise e
             elif action == 'delete_file':
                 if SEND2TRASH_AVAILABLE:
                     send2trash(normalize_path(src))
@@ -442,12 +449,21 @@ class SyncApp:
 
     def setup_settings_tab(self, parent):
         parent.columnconfigure(0, weight=1)
+        # Статистика
         self.stats_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             parent,
             text="Показывать подробную статистику при сравнении (замедляет анализ)",
             variable=self.stats_enabled
         ).grid(row=0, column=0, sticky=tk.W, pady=5)
+
+        # Отказоустойчивое копирование
+        self.safe_copy_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            parent,
+            text="Использовать отказоустойчивое копирование (через временные файлы)",
+            variable=self.safe_copy_enabled
+        ).grid(row=1, column=0, sticky=tk.W, pady=5)
 
     def add_pair(self):
         src = filedialog.askdirectory(title="Выберите исходную папку")
@@ -671,7 +687,8 @@ class SyncApp:
             apply_sync(
                 all_actions,
                 progress_callback=lambda cur, tot: self.root.after(0, lambda: self.update_progress(cur, tot)),
-                log_callback=lambda act, s, d: self.root.after(0, lambda: self._log_action(act, s, d))
+                log_callback=lambda act, s, d: self.root.after(0, lambda: self._log_action(act, s, d)),
+                use_safe_copy=self.safe_copy_enabled.get()
             )
         self.root.after(0, self.sync_finished)
 
@@ -720,6 +737,10 @@ class SyncApp:
             ET.SubElement(exclude_el, "Item").text = pat
         mode_el = ET.SubElement(root, "Mode")
         mode_el.text = self.mode_var.get()
+        safe_el = ET.SubElement(root, "SafeCopy")
+        safe_el.text = str(self.safe_copy_enabled.get())
+        stats_el = ET.SubElement(root, "StatsEnabled")
+        stats_el.text = str(self.stats_enabled.get())
         tree = ET.ElementTree(root)
         tree.write(filepath, encoding='utf-8', xml_declaration=True)
         self.log_message(f"Конфигурация сохранена: {filepath}")
@@ -762,6 +783,12 @@ class SyncApp:
             mode_el = root.find("Mode")
             if mode_el is not None and mode_el.text in ("update", "mirror"):
                 self.mode_var.set(mode_el.text)
+            safe_el = root.find("SafeCopy")
+            if safe_el is not None and safe_el.text.lower() in ("true", "false"):
+                self.safe_copy_enabled.set(safe_el.text.lower() == "true")
+            stats_el = root.find("StatsEnabled")
+            if stats_el is not None and stats_el.text.lower() in ("true", "false"):
+                self.stats_enabled.set(stats_el.text.lower() == "true")
             self.log_message(f"Конфигурация загружена: {filepath}")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить конфигурацию:\n{e}")
@@ -795,7 +822,7 @@ class SyncApp:
 - Поддержку длинных путей (>260 символов)
 - Логирование в реальном времени
 - Опциональную статистику по объёмам
-- Отказоустойчивое копирование через временные файлы
+- Отказоустойчивое копирование через временные файлы (опционально)
 Используемые технологии:
 - Python 3.x
 - tkinter (GUI)
