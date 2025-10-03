@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pywintypes # Требуется: pip install pywin32
 import win32security # Требуется: pip install pywin32
 import win32file # Требуется: pip install pywin32
-import ntfsutils.streams as streams # Требуется: pip install ntfsutils
+# import ntfsutils.streams as streams # Требуется: pip install ntfsutils
 # import pyshadowcopy # Комментарий: библиотека может потребовать ручной установки или быть устаревшей. Пример VSS ниже использует win32com.client.
 
 # --- Вспомогательные функции ---
@@ -59,7 +59,7 @@ def safe_copy_file_with_retry(src_path, dst_path, max_retries=3, initial_delay=1
 
     Args:
         src_path (Path): Путь к исходному файлу.
-        dst_path (Path): Путь к целевому файлу.
+        dst_path (str): Путь к целевому файлу (в формате длинного пути).
         max_retries (int): Максимальное количество попыток.
         initial_delay (float): Начальная задержка между попытками.
         backoff_factor (float): Множитель для экспоненциального увеличения задержки.
@@ -69,7 +69,9 @@ def safe_copy_file_with_retry(src_path, dst_path, max_retries=3, initial_delay=1
     Returns:
         bool: True, если копирование прошло успешно, иначе False.
     """
-    temp_dst_path = dst_path.with_name(dst_path.name + '.NTFSSync_tmp')
+    # Преобразуем строку в Path для использования методов Path
+    dst_path_obj = Path(dst_path)
+    temp_dst_path = dst_path_obj.with_name(dst_path_obj.name + '.NTFSSync_tmp')
 
     for attempt in range(max_retries):
         try:
@@ -91,6 +93,7 @@ def safe_copy_file_with_retry(src_path, dst_path, max_retries=3, initial_delay=1
                     raise OSError(f"Проверка хеша не пройдена для временного файла: {temp_dst_path}")
 
             # 5. Атомарно заменяем целевой файл временным
+            # os.replace также работает со строками путей
             os.replace(temp_dst_path, dst_path)
             logging.info(f"Файл успешно скопирован: {src_path} -> {dst_path}")
             return True
@@ -126,23 +129,34 @@ def safe_copy_file_with_retry(src_path, dst_path, max_retries=3, initial_delay=1
 
 def copy_ntfs_ads(src_path, dst_path):
     """
-    Копирует альтернативные потоки данных (ADS) из исходного файла в целевой.
-
-    Args:
-        src_path (Path): Путь к исходному файлу.
-        dst_path (Path): Путь к целевому файлу.
+    Копирует альтернативные потоки данных (ADS) из исходного файла в целевой, используя win32file.
     """
     try:
-        # Получаем список потоков для исходного файла
-        stream_list = list(streams.list_streams(src_path))
-        logging.debug(f"ADS для {src_path}: {stream_list}")
-        for stream_name in stream_list:
-            if stream_name == ':$DATA':  # Пропускаем основной поток данных
-                continue
-            # Формируем путь к потоку для чтения
-            src_stream_path = f"{src_path}{stream_name}"
-            # Формируем путь к потоку для записи
-            dst_stream_path = f"{dst_path}{stream_name}"
+        # Используем str() для передачи пути в win32file, если dst_path - строка
+        # Если dst_path - Path, str() всё равно преобразует его в строку
+        src_str = str(src_path)
+        dst_str = str(dst_path)
+
+        # Используем FindFirstStreamW для перечисления потоков
+        handle = win32file.FindFirstStreamW(src_str, win32file.StreamInfoTypes.FindStreamInfoStandard)
+        streams_found = []
+        while True:
+            stream_name, stream_size = handle[0], handle[1]
+            # Основной поток имеет имя ':$DATA', его пропускаем
+            if stream_name != ':$DATA':
+                clean_name = stream_name
+                streams_found.append(clean_name)
+            try:
+                handle = win32file.FindNextStreamW(handle)
+            except pywintypes.error:
+                break
+        win32file.FindClose(handle)
+
+        logging.debug(f"ADS для {src_path}: {streams_found}")
+        for stream_name in streams_found:
+            # Формируем путь к потоку для чтения и записи, используя синтаксис ':stream_name'
+            src_stream_path = f"{src_str}{stream_name}" # e.g., C:\path\file.txt:stream_name
+            dst_stream_path = f"{dst_str}{stream_name}" # e.g., D:\path\file.txt:stream_name
             # Читаем содержимое потока
             with open(src_stream_path, 'rb') as src_stream:
                 data = src_stream.read()
@@ -150,6 +164,9 @@ def copy_ntfs_ads(src_path, dst_path):
             with open(dst_stream_path, 'wb') as dst_stream:
                 dst_stream.write(data)
             logging.debug(f"Скопирован ADS: {src_stream_path} -> {dst_stream_path}")
+    except pywintypes.error as e:
+        # win32file может генерировать pywintypes.error
+        logging.error(f"Ошибка win32file при работе с ADS для {src_path}: {e}")
     except Exception as e:
         logging.error(f"Ошибка копирования ADS для {src_path}: {e}")
 
@@ -217,7 +234,7 @@ def safe_remove_with_retry(file_path, max_retries=3, initial_delay=1, backoff_fa
     Безопасно удаляет файл с повторными попытками при ошибках блокировки.
 
     Args:
-        file_path (str): Путь к файлу для удаления.
+        file_path (str): Путь к файлу для удаления (в формате длинного пути).
         max_retries (int): Максимальное количество попыток.
         initial_delay (float): Начальная задержка между попытками.
         backoff_factor (float): Множитель для экспоненциального увеличения задержки.
@@ -225,8 +242,14 @@ def safe_remove_with_retry(file_path, max_retries=3, initial_delay=1, backoff_fa
     Returns:
         bool: True, если удаление прошло успешно, иначе False.
     """
+    # os.remove работает со строками, так что Path не обязателен здесь,
+    # но если вы хотите использовать Path для каких-то проверок, можно:
+    # file_path_obj = Path(file_path)
+    # или просто используйте file_path как строку, как раньше.
+
     for attempt in range(max_retries):
         try:
+            # os.remove принимает строку
             os.remove(file_path)
             logging.info(f"Файл успешно удален: {file_path}")
             return True
