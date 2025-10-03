@@ -53,7 +53,7 @@ def is_file_locked(filepath):
     except (IOError, OSError):
         return True
 
-def safe_copy_file_with_retry(src_path, dst_path, max_retries=3, initial_delay=1, backoff_factor=2, mtime_tolerance=1):
+def safe_copy_file_with_retry(src_path, dst_path, max_retries=3, initial_delay=1, backoff_factor=2, mtime_tolerance=1, verify_hash=False):
     """
     Отказоустойчиво копирует файл с повторными попытками и использованием временного файла.
 
@@ -64,6 +64,7 @@ def safe_copy_file_with_retry(src_path, dst_path, max_retries=3, initial_delay=1
         initial_delay (float): Начальная задержка между попытками.
         backoff_factor (float): Множитель для экспоненциального увеличения задержки.
         mtime_tolerance (float): Допуск для сравнения времени модификации.
+        verify_hash (bool): Проверять ли целостность хешем после копирования.
 
     Returns:
         bool: True, если копирование прошло успешно, иначе False.
@@ -82,11 +83,12 @@ def safe_copy_file_with_retry(src_path, dst_path, max_retries=3, initial_delay=1
             # 3. Копируем ADS
             copy_ntfs_ads(src_path, temp_dst_path)
 
-            # 4. Проверка целостности (опционально, если включено)
-            # src_size, src_mtime = get_file_info(src_path)
-            # dst_size, dst_mtime = get_file_info(temp_dst_path)
-            # if src_size != dst_size or abs(src_mtime - dst_mtime) > mtime_tolerance:
-            #     raise OSError(f"Скопированный файл {temp_dst_path} не соответствует исходному {src_path} по размеру или времени.")
+            # 4. Проверка целостности (опционально)
+            if verify_hash:
+                src_hash = calculate_hash(src_path)
+                dst_hash = calculate_hash(temp_dst_path)
+                if src_hash is None or dst_hash is None or src_hash != dst_hash:
+                    raise OSError(f"Проверка хеша не пройдена для временного файла: {temp_dst_path}")
 
             # 5. Атомарно заменяем целевой файл временным
             os.replace(temp_dst_path, dst_path)
@@ -210,13 +212,45 @@ def matches_any_pattern(path, patterns):
             return True
     return False
 
+def safe_remove_with_retry(file_path, max_retries=3, initial_delay=1, backoff_factor=2):
+    """
+    Безопасно удаляет файл с повторными попытками при ошибках блокировки.
+
+    Args:
+        file_path (str): Путь к файлу для удаления.
+        max_retries (int): Максимальное количество попыток.
+        initial_delay (float): Начальная задержка между попытками.
+        backoff_factor (float): Множитель для экспоненциального увеличения задержки.
+
+    Returns:
+        bool: True, если удаление прошло успешно, иначе False.
+    """
+    for attempt in range(max_retries):
+        try:
+            os.remove(file_path)
+            logging.info(f"Файл успешно удален: {file_path}")
+            return True
+        except (OSError, pywintypes.error) as e:
+            logging.warning(f"Ошибка удаления файла (попытка {attempt + 1}): {file_path}, Ошибка: {e}")
+            if attempt < max_retries - 1:
+                delay = initial_delay * (backoff_factor ** attempt)
+                logging.debug(f"Ожидание {delay:.2f} секунд перед повторной попыткой удаления...")
+                time.sleep(delay)
+            else:
+                logging.error(f"Не удалось удалить файл после {max_retries} попыток: {file_path}")
+                return False
+        except Exception as e:
+            logging.error(f"Неожиданная ошибка при удалении файла {file_path}: {e}")
+            return False
+    return False
+
 # --- Основная логика синхронизации ---
 
 class NTFSSync:
     """
     Класс для синхронизации каталогов с поддержкой NTFS.
     """
-    def __init__(self, source, destination, mode='update', threads=1, dry_run=False, log_file=None, use_vss=False, max_retries=3, initial_delay=1, backoff_factor=2, mtime_tolerance=1, exclude_patterns=None):
+    def __init__(self, source, destination, mode='update', threads=1, dry_run=False, log_file=None, use_vss=False, max_retries=3, initial_delay=1, backoff_factor=2, mtime_tolerance=1, exclude_patterns=None, verify_hash=False):
         """
         Инициализирует объект синхронизации.
 
@@ -228,11 +262,12 @@ class NTFSSync:
             dry_run (bool): Режим пробного запуска.
             log_file (str, optional): Путь к файлу лога.
             use_vss (bool): Использовать VSS для заблокированных файлов (заглушка).
-            max_retries (int): Максимальное количество попыток копирования.
+            max_retries (int): Максимальное количество попыток копирования/удаления.
             initial_delay (float): Начальная задержка между попытками.
             backoff_factor (float): Множитель для экспоненциального увеличения задержки.
             mtime_tolerance (float): Допуск для сравнения времени модификации.
             exclude_patterns (list): Список шаблонов для исключения файлов/папок.
+            verify_hash (bool): Проверять ли целостность хешем после копирования.
         """
         self.source = Path(source).resolve()
         self.destination = Path(destination).resolve()
@@ -244,6 +279,7 @@ class NTFSSync:
         self.initial_delay = initial_delay
         self.backoff_factor = backoff_factor
         self.mtime_tolerance = mtime_tolerance
+        self.verify_hash = verify_hash
         self.exclude_patterns = exclude_patterns or []
 
         self.changed_files = []
@@ -343,6 +379,11 @@ class NTFSSync:
             dst_file (Path): Путь к целевому файлу.
         """
         try:
+            # Проверка, что src_file - файл
+            if not src_file.is_file():
+                 logging.warning(f"Источник не является файлом, пропуск: {src_file}")
+                 return
+
             # Преобразуем пути для поддержки длинных имен
             long_dst_file = get_long_path(str(dst_file))
             long_dst_parent = get_long_path(str(dst_file.parent))
@@ -364,7 +405,8 @@ class NTFSSync:
                     max_retries=self.max_retries,
                     initial_delay=self.initial_delay,
                     backoff_factor=self.backoff_factor,
-                    mtime_tolerance=self.mtime_tolerance
+                    mtime_tolerance=self.mtime_tolerance,
+                    verify_hash=self.verify_hash
                 )
                 if not success:
                     logging.error(f"Файл не был скопирован после всех попыток: {src_file}")
@@ -415,8 +457,17 @@ class NTFSSync:
             for file_to_delete in self.deleted_files:
                 long_file_to_delete = get_long_path(str(file_to_delete))
                 try:
-                    os.remove(long_file_to_delete)
-                    logging.info(f"Удален файл: {long_file_to_delete}")
+                    if not self.dry_run:
+                        success = safe_remove_with_retry(
+                            long_file_to_delete,
+                            max_retries=self.max_retries,
+                            initial_delay=self.initial_delay,
+                            backoff_factor=self.backoff_factor
+                        )
+                        if not success:
+                            self.error_files.append(file_to_delete)
+                    else:
+                        logging.info(f"[DRY-RUN] Будет удален файл: {long_file_to_delete}")
                 except Exception as e:
                     logging.error(f"Ошибка удаления файла {long_file_to_delete}: {e}")
                     self.error_files.append(file_to_delete) # Считаем это ошибкой
@@ -425,18 +476,24 @@ class NTFSSync:
         if self.mode == 'mirror' and not self.dry_run:
             logging.info("Начало очистки пустых директорий в целевом каталоге...")
             # Обход в обратном порядке (от листьев к корню)
+            # Сначала собираем все подкаталоги цели
+            all_dirs = []
             for root, dirs, files in os.walk(self.destination, topdown=False):
-                for dir_name in dirs:
-                    dir_path = Path(root) / dir_name
-                    try:
-                        # Проверяем, пуста ли директория (только файлы/папки, игнорируя системные)
-                        if not any(dir_path.iterdir()):
-                            dir_path.rmdir()
-                            logging.info(f"Удалена пустая директория: {dir_path}")
-                        else:
-                            logging.debug(f"Директория не пуста, пропущена: {dir_path}")
-                    except OSError as e:
-                        logging.warning(f"Не удалось удалить пустую директорию {dir_path}: {e}")
+                 for dir_name in dirs:
+                     dir_path = Path(root) / dir_name
+                     all_dirs.append(dir_path)
+
+            # Теперь удаляем пустые директории
+            for dir_path in all_dirs:
+                try:
+                    # Проверяем, пуста ли директория (только файлы/папки, игнорируя системные)
+                    if not any(dir_path.iterdir()):
+                        dir_path.rmdir()
+                        logging.info(f"Удалена пустая директория: {dir_path}")
+                    else:
+                        logging.debug(f"Директория не пуста, пропущена: {dir_path}")
+                except OSError as e:
+                    logging.warning(f"Не удалось удалить пустую директорию {dir_path}: {e}")
 
         logging.info("Синхронизация завершена.")
 
@@ -455,15 +512,17 @@ def main():
     parser.add_argument("--use-vss", action='store_true',
                         help="Попытаться использовать VSS для заблокированных файлов (реализация отсутствует)")
     parser.add_argument("--max-retries", type=int, default=3,
-                        help="Максимальное количество попыток копирования файла (по умолчанию 3)")
+                        help="Максимальное количество попыток копирования/удаления файла (по умолчанию 3)")
     parser.add_argument("--initial-delay", type=float, default=1.0,
-                        help="Начальная задержка между попытками копирования (по умолчанию 1.0 с)")
+                        help="Начальная задержка между попытками копирования/удаления (по умолчанию 1.0 с)")
     parser.add_argument("--backoff-factor", type=float, default=2.0,
                         help="Множитель для экспоненциального увеличения задержки (по умолчанию 2.0)")
     parser.add_argument("--mtime-tolerance", type=float, default=1.0,
                         help="Допуск для сравнения времени модификации файлов (по умолчанию 1.0 с)")
     parser.add_argument("--exclude", action='append', default=[],
                         help="Шаблон для исключения файлов/папок (например, '*.tmp'). Можно указать несколько раз.")
+    parser.add_argument("--verify-hash", action='store_true',
+                        help="Проверять целостность скопированных файлов с помощью хеша SHA256.")
 
     args = parser.parse_args()
 
@@ -479,7 +538,8 @@ def main():
         initial_delay=args.initial_delay,
         backoff_factor=args.backoff_factor,
         mtime_tolerance=args.mtime_tolerance,
-        exclude_patterns=args.exclude
+        exclude_patterns=args.exclude,
+        verify_hash=args.verify_hash
     )
     sync_engine.run_sync()
 
