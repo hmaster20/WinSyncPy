@@ -38,8 +38,9 @@ from tkinter import ttk, filedialog, messagebox
 
 # --- Метаданные приложения ---
 APP_NAME = "WinSync"
-APP_VERSION = "1.6.0"
-BUILD_DATE = "2025-10-02"
+APP_VERSION = "1.6.1"  # Обновлена версия
+BUILD_DATE = "2025-10-06"
+
 CONFIG_PATH = os.path.expanduser("~/.winsync_config.ws")
 
 # --- Поддержка корзины ---
@@ -54,6 +55,15 @@ ERRORS = []
 ERRORS_LOCK = threading.Lock()
 
 # --- Вспомогательные функции ---
+def resource_path(relative_path):
+    """Получает абсолютный путь к ресурсу, работает и в .py, и в .exe (PyInstaller)."""
+    try:
+        # PyInstaller создаёт временную папку и сохраняет путь в _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
 def normalize_path(path):
     """Добавляет префикс \\?\ для поддержки длинных путей (длиннее 260 символов)."""
     path = os.path.abspath(path)
@@ -300,6 +310,21 @@ class SyncApp:
         self.root.title("Windows синхронизация")
         self.root.geometry("860x600")
         self.root.resizable(True, True)
+
+        # Установка иконки с поддержкой PyInstaller и fallback
+        ico_path = resource_path("winsync.ico")
+        png_path = resource_path("winsync.png")
+        try:
+            if os.path.exists(ico_path):
+                root.iconbitmap(ico_path)
+            elif os.path.exists(png_path):
+                icon = tk.PhotoImage(file=png_path)
+                root.iconphoto(True, icon)
+            else:
+                print("Иконка не найдена.")
+        except Exception as e:
+            print(f"Не удалось загрузить иконку: {e}")
+
         self.exclude_patterns = [
             r'\System Volume Information\\',
             r'\$Recycle\.Bin\\',
@@ -829,7 +854,9 @@ class SyncApp:
 - win32security / win32file (NTFS ACL, ADS)
 - send2trash (опционально, для корзины)
 - threading (фоновые операции)
-© 2025 Пользователь Windows
+GitHub: https://github.com/hmaster20/WinSyncPy
+Лицензия: GNU GPL v3.0 ⚖️
+Copyright © 2025 Hmaster20 (https://github.com/hmaster20)
 """
         messagebox.showinfo("О программе", about_text)
 
