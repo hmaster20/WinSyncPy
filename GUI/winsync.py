@@ -38,8 +38,8 @@ from tkinter import ttk, filedialog, messagebox
 
 # --- Метаданные приложения ---
 APP_NAME = "WinSync"
-APP_VERSION = "1.6.1"  # Обновлена версия
-BUILD_DATE = "2025-10-06"
+APP_VERSION = "1.6.2"
+BUILD_DATE = "2025-11-05"
 
 CONFIG_PATH = os.path.expanduser("~/.winsync_config.ws")
 
